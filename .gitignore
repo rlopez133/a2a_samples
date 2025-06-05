@@ -1,0 +1,13 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Backup files
+*.orig
+
+# Local config (e.g., tokens or secrets)
+version_4_multi_agent_mcp/utilities/mcp/mcp_config.json
+version_4_multi_agent_mcp/utilities/mcp/mcp_config_private.json
+

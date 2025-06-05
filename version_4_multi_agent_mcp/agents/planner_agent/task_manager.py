@@ -1,42 +1,46 @@
 # =============================================================================
-# agents/tell_time_agent/task_manager.py - Updated for Claude
+# agents/planner_agent/task_manager.py - Updated for Claude
+# =============================================================================
+# 🎯 Purpose:
+# Task manager for PlannerAgent using Claude - exact same pattern as your tell_time_agent
 # =============================================================================
 
 import logging
 from server.task_manager import InMemoryTaskManager
-from agents.tell_time_agent.agent import TellTimeAgent
+from agents.planner_agent.agent import PlannerAgent
 from models.request import SendTaskRequest, SendTaskResponse
 from models.task import Message, Task, TextPart, TaskStatus, TaskState
 
 logger = logging.getLogger(__name__)
 
+
 class AgentTaskManager(InMemoryTaskManager):
     """
-    Task manager for TellTimeAgent using Claude
-    Keeps the exact same name and interface as original
+    Task manager for PlannerAgent using Claude
+    Keeps the exact same name and interface as your tell_time_agent pattern
     """
     
-    def __init__(self, agent: TellTimeAgent):
+    def __init__(self, agent: PlannerAgent):
         """
-        Initialize with the Claude-based TellTimeAgent
-        Same interface as original
+        Initialize with the Claude-based PlannerAgent
+        Same interface as your tell_time_agent
         """
         super().__init__()
         self.agent = agent
-        
+    
     def _get_user_query(self, request: SendTaskRequest) -> str:
         """
         Get the user's text input from the request object.
-        Same as original implementation
+        Same as your tell_time_agent implementation
         """
         return request.params.message.parts[0].text
     
     async def on_send_task(self, request: SendTaskRequest) -> SendTaskResponse:
         """
         Handle `tasks/send` calls from other A2A agents.
-        Same interface as original, just using Claude instead of Gemini
+        Same interface as your tell_time_agent, just using Claude for planning instead of time
         """
-        logger.info(f"Processing new task: {request.params.id}")
+        logger.info(f"PlannerAgent processing task: {request.params.id}")
         
         # Step 1: Save the task using the base class helper
         task = await self.upsert_task(request.params)
@@ -44,7 +48,7 @@ class AgentTaskManager(InMemoryTaskManager):
         # Step 2: Get what the user asked
         query = self._get_user_query(request)
         
-        # Step 3: Ask the Claude agent to respond
+        # Step 3: Ask the Claude agent to respond with cluster assessment
         result_text = await self.agent.invoke(query, request.params.sessionId)
         
         # Step 4: Turn the agent's response into a Message object

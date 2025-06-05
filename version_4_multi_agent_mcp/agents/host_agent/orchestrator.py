@@ -1,279 +1,272 @@
 # =============================================================================
-# agents/host_agent/orchestrator.py
+# agents/host_agent/claude_orchestrator.py
 # =============================================================================
 # 🎯 Purpose:
-# Defines the OrchestratorAgent, which:
-#   1) Discovers and calls other A2A agents (via DiscoveryClient & AgentConnector)
-#   2) Discovers and loads MCP tools (via MCPConnector)
-#   3) Exposes each A2A action and each MCP tool as its own callable tool
-# Also defines OrchestratorTaskManager to serve this agent over JSON-RPC.
+# Claude-based orchestrator that coordinates between A2A agents and MCP tools
+# Same functionality as the Gemini orchestrator but using Claude Sonnet 4
 # =============================================================================
 
-import uuid                            # For generating unique session identifiers
-import logging                         # For writing log messages to console or file
-import asyncio                         # For running asynchronous tasks from synchronous code
-from dotenv import load_dotenv         # To load environment variables from a .env file
+import uuid
+import logging
+import asyncio
+import os
+import anthropic
+from dotenv import load_dotenv
 
-# Load environment variables from .env (e.g., GOOGLE_API_KEY)
+# Load environment variables
 load_dotenv()
 
-# -----------------------------------------------------------------------------
-# Google ADK / Gemini imports: classes and functions to build and run LLM agents
-# -----------------------------------------------------------------------------
-from google.adk.agents.llm_agent import LlmAgent                # Main LLM agent class
-from google.adk.sessions import InMemorySessionService          # Simple in-memory session storage
-from google.adk.memory.in_memory_memory_service import InMemoryMemoryService  # In-memory memory storage
-from google.adk.artifacts import InMemoryArtifactService        # In-memory artifact storage (files, binaries)
-from google.adk.runners import Runner                           # Coordinates LLM, sessions, memory, and tools
-from google.adk.agents.readonly_context import ReadonlyContext  # Provides read-only context to system prompts
-from google.adk.tools.tool_context import ToolContext           # Carries state between tool invocations
-from google.adk.tools.function_tool import FunctionTool         # Wraps a Python function as a callable LLM tool
-from google.genai import types                                 # For wrapping user messages into LLM-friendly format
+# A2A infrastructure imports
+from server.task_manager import InMemoryTaskManager
+from models.request import SendTaskRequest, SendTaskResponse
+from models.task import Message, TaskStatus, TaskState, TextPart
 
-# -----------------------------------------------------------------------------
-# A2A infrastructure imports: task manager and message models for JSON-RPC
-# -----------------------------------------------------------------------------
-from server.task_manager import InMemoryTaskManager               # Base class for task storage and locking
-from models.request import SendTaskRequest, SendTaskResponse      # JSON-RPC request/response models
-from models.task import Message, TaskStatus, TaskState, TextPart   # Task, message, and status data models
+# A2A discovery & connector imports
+from utilities.a2a.agent_discovery import DiscoveryClient
+from utilities.a2a.agent_connect import AgentConnector
 
-# -----------------------------------------------------------------------------
-# A2A discovery & connector imports: to find and call remote A2A agents
-# -----------------------------------------------------------------------------
-from utilities.a2a.agent_discovery import DiscoveryClient        # Finds agent URLs from registry file
-from utilities.a2a.agent_connect import AgentConnector          # Sends tasks to remote A2A agents
-
-# -----------------------------------------------------------------------------
-# MCP connector import: to discover and call MCP servers/tools
-# -----------------------------------------------------------------------------
-from utilities.mcp.mcp_connect import MCPConnector              # Connects to MCP servers and lists tools
+# MCP connector import
+from utilities.mcp.mcp_connect import MCPConnector
 
 # Import AgentCard model for typing
-from models.agent import AgentCard                              # Metadata structure describing an agent
+from models.agent import AgentCard
 
-# -----------------------------------------------------------------------------
-# Logging setup: configure root logger to show INFO and above
-# -----------------------------------------------------------------------------
-logger = logging.getLogger(__name__)                           # Create a logger for this module
-logging.basicConfig(level=logging.INFO)                        # Show INFO-level logs in the console
+# Logging setup
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
-class OrchestratorAgent:
+class ClaudeOrchestratorAgent:
     """
-    🤖 OrchestratorAgent:
+    🤖 Claude-based OrchestratorAgent:
       - Discovers A2A agents via DiscoveryClient → list of AgentCards
       - Connects to each A2A agent with AgentConnector
       - Discovers MCP servers via MCPConnector and loads MCP tools
-      - Exposes each A2A action and each MCP tool as its own callable tool
+      - Uses Claude Sonnet 4 to decide which tools to call
       - Routes user queries by picking and invoking the correct tool
     """
     
-    # Specify supported MIME types for input/output (we only handle plain text)
     SUPPORTED_CONTENT_TYPES = ["text", "text/plain"]
 
     def __init__(self, agent_cards: list[AgentCard]):
         """
-        Initialize the orchestrator with discovered A2A agents and MCP tools.
-
-        Args:
-            agent_cards (list[AgentCard]): Metadata for each A2A child agent.
+        Initialize the Claude-based orchestrator with discovered A2A agents and MCP tools.
         """
-        # 1) Build connectors for each A2A agent
-        self.connectors = {}                                  # Dict mapping agent name → AgentConnector
+        # Initialize Claude client
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY environment variable is required")
+            
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.model = "claude-sonnet-4-20250514"
+        
+        # Build connectors for each A2A agent
+        self.connectors = {}
         for card in agent_cards:
-            # Create a connector to send tasks to this agent's URL
             self.connectors[card.name] = AgentConnector(card.name, card.url)
             logger.info(f"Registered A2A connector for: {card.name}")
 
-        # 2) Load all MCP tools once at startup
-        self.mcp = MCPConnector()                              # Reads mcp_config.json internally
-        mcp_tools = self.mcp.get_tools()                       # Retrieve list of MCPTool instances
-        logger.info(f"Loaded {len(mcp_tools)} MCP tools")
+        # Load all MCP tools once at startup
+        self.mcp = MCPConnector()
+        self.mcp_tools = self.mcp.get_tools()
+        logger.info(f"Loaded {len(self.mcp_tools)} MCP tools")
 
-        # 3) Wrap each MCPTool.run into a simple async function for ADK
-        self._mcp_wrappers = []                                # List of FunctionTool instances
-        
-        def make_wrapper(tool):                                # Factory creates a wrapper for a given MCPTool
-            # Define an async function that accepts a single dict of args
-            async def wrapper(args: dict) -> str:
-                # Call the tool's run() to execute MCP command
-                return await tool.run(args)
-            # Name the wrapper so ADK can refer to it by the tool's name
-            wrapper.__name__ = tool.name
-            return wrapper
+        self._user_id = "orchestrator_user"
 
-        # Create and register a FunctionTool for each MCP tool
-        for tool in mcp_tools:
-            fn = make_wrapper(tool)                            # Build the async stub
-            self._mcp_wrappers.append(FunctionTool(fn))        # Wrap stub as an ADK tool
-            logger.info(f"Wrapped MCP tool for LLM: {tool.name}")
-
-        # 4) Build the Gemini LLM agent and its Runner
-        self._agent = self._build_agent()                      # Assemble LlmAgent with tools
-        self._user_id = "orchestrator_user"                   # Fixed user ID for session tracking
-        self._runner = Runner(
-            app_name=self._agent.name,                         # Name of this agent
-            agent=self._agent,                                 # LLM agent object
-            artifact_service=InMemoryArtifactService(),        # In-memory artifact handler
-            session_service=InMemorySessionService(),          # In-memory session storage
-            memory_service=InMemoryMemoryService(),            # In-memory conversation memory
-        )
-
-    def _build_agent(self) -> LlmAgent:
-        """
-        Construct the Gemini LLM agent with all available tools.
-
-        Returns:
-            LlmAgent: Configured ADK agent ready to run.
-        """
-        # Gather A2A and MCP tools into one list
-        tools = [
-            self._list_agents,    # Function listing child A2A agents
-            self._delegate_task,  # Async function for routing to A2A agents
-            *self._mcp_wrappers    # Unpack all MCP tool wrappers
-        ]
-        # Create and return the LlmAgent
-        return LlmAgent(
-            # model="gemini-1.5-flash-latest",                 # Gemini model variant
-            model="gemini-2.5-flash-preview-04-17",
-            name="orchestrator_agent",                        # Unique name for this agent
-            description="Routes requests to A2A agents or MCP tools.",
-            instruction=self._root_instruction,                  # System prompt callback
-            tools=tools,                                        # List of tool functions
-        )
-
-    def _root_instruction(self, context: ReadonlyContext) -> str:
-        """
-        System prompt generator: instructs the LLM how to use available tools.
-
-        Args:
-            context (ReadonlyContext): Read-only context (unused here).
-        """
-        return (
-            "You are an orchestrator with two tool categories:\n"
-            "1) A2A agent tools: list_agents(), delegate_task(agent_name, message)\n"
-            "2) MCP tools: one FunctionTool per tool name\n"
-            "Pick exactly the right tool by its name and call it with correct args. Do NOT hallucinate."
-        )
-
-    def _list_agents(self) -> list[str]:
-        """
-        A2A tool: returns the list of names of registered child agents.
-
-        Returns:
-            list[str]: Agent names for delegation.
-        """
+    def _get_available_agents(self) -> list[str]:
+        """Return list of available agent names."""
         return list(self.connectors.keys())
 
-    async def _delegate_task(
-        self,
-        agent_name: str,
-        message: str,
-        tool_context: ToolContext
-    ) -> str:
-        """
-        A2A tool: forwards a message to a child agent and returns its reply.
+    def _get_available_mcp_tools(self) -> list[str]:
+        """Return list of available MCP tool names."""
+        return [tool.name for tool in self.mcp_tools]
 
-        Args:
-            agent_name (str): Name of the target agent.
-            message (str): The user message to send.
-            tool_context (ToolContext): Holds state across invocations (e.g., session ID).
-
-        Returns:
-            str: The text of the agent's reply, or empty string on failure.
+    async def _delegate_task(self, agent_name: str, message: str, session_id: str) -> str:
         """
-        # Ensure the agent exists
+        Forward a message to a child agent and return its reply.
+        """
         if agent_name not in self.connectors:
             raise ValueError(f"Unknown agent: {agent_name}")
-        # Persist or create a session_id between calls
-        state = tool_context.state
-        if "session_id" not in state:
-            state["session_id"] = str(uuid.uuid4())
-        session_id = state["session_id"]
-        # Send the task and await its completion
-        task = await self.connectors[agent_name].send_task(message, session_id)
-        # Extract the last history entry if present
-        if task.history and len(task.history) > 1:
-            return task.history[-1].parts[0].text
-        return ""
+        
+        try:
+            # Send the task and await its completion
+            task = await self.connectors[agent_name].send_task(message, session_id)
+            
+            # Extract the last history entry if present
+            if task.history and len(task.history) > 1:
+                return task.history[-1].parts[0].text
+            return "No response from agent"
+            
+        except Exception as e:
+            logger.error(f"Error delegating to {agent_name}: {e}")
+            return f"Error communicating with {agent_name}: {str(e)}"
+
+    async def _call_mcp_tool(self, tool_name: str, args: dict) -> str:
+        """
+        Call an MCP tool and return its result.
+        """
+        try:
+            # Find the tool
+            tool = next((t for t in self.mcp_tools if t.name == tool_name), None)
+            if not tool:
+                return f"MCP tool {tool_name} not found"
+            
+            # Call the tool
+            result = await tool.run(args)
+            return str(result)
+            
+        except Exception as e:
+            logger.error(f"Error calling MCP tool {tool_name}: {e}")
+            return f"Error calling {tool_name}: {str(e)}"
+
+    def _build_system_prompt(self, session_id: str) -> str:
+        """
+        Build the system prompt for Claude with available tools and capabilities.
+        """
+        available_agents = self._get_available_agents()
+        available_mcp_tools = self._get_available_mcp_tools()
+        
+        return f"""You are an orchestrator agent that coordinates between specialized agents and MCP tools.
+
+AVAILABLE A2A AGENTS:
+{', '.join(available_agents)}
+
+AVAILABLE MCP TOOLS:
+{', '.join(available_mcp_tools)}
+
+COORDINATION CAPABILITIES:
+1. For deployment requests involving Monte Carlo applications:
+   - First delegate to PlannerAgent to assess cluster readiness
+   - Then delegate to ExecutorAgent to perform the deployment
+   
+2. For assessment requests:
+   - Delegate to PlannerAgent for cluster assessment
+   
+3. For direct tool needs:
+   - Use MCP tools directly for specific operations
+
+AGENT SPECIALIZATIONS:
+- PlannerAgent: Kubernetes cluster assessment, namespace checking
+- ExecutorAgent: Ansible AAP deployment execution, job monitoring
+- TellTimeAgent: Current time information
+- GreetingAgent: Personalized greetings
+
+WORKFLOW EXAMPLES:
+User: "Deploy Monte Carlo to namespace-xyz"
+→ 1. Call PlannerAgent: "Assess cluster readiness for namespace-xyz"
+→ 2. If ready, call ExecutorAgent: "Deploy Monte Carlo to namespace-xyz" 
+→ 3. Return coordinated results
+
+User: "Check cluster status for monte-carlo-prod"
+→ Call PlannerAgent: "Assess monte-carlo-prod namespace"
+
+Session ID: {session_id}
+
+Analyze the user request and determine the best approach. If it involves Monte Carlo deployment, coordinate between PlannerAgent and ExecutorAgent. Be specific about which agent to call and what message to send."""
 
     async def invoke(self, query: str, session_id: str) -> str:
         """
-        Primary entrypoint: handles a user query.
-
-        Steps:
-          1) Create or retrieve a session
-          2) Wrap query into LLM Content format
-          3) Run the Runner (may invoke tools)
-          4) Return the final text output
-        Note - function updated 28 May 2025
-        Summary of changes:
-        1. Agent's invoke method is made async
-        2. All async calls (get_session, create_session, run_async) 
-            are awaited inside invoke method
-        3. task manager's on_send_task updated to await the invoke call
-
-        Reason - get_session and create_session are async in the 
-        "Current" Google ADK version and were synchronous earlier 
-        when this lecture was recorded. This is due to a recent change 
-        in the Google ADK code 
-        https://github.com/google/adk-python/commit/1804ca39a678433293158ec066d44c30eeb8e23b
-
+        Primary entrypoint: handles a user query using Claude to orchestrate tools.
         """
-        # 1) Get or create a session for this user and session_id
-        session = await self._runner.session_service.get_session(
-            app_name=self._agent.name,
-            user_id=self._user_id,
-            session_id=session_id
-        )
-        if session is None:
-            session = await self._runner.session_service.create_session(
-                app_name=self._agent.name,
-                user_id=self._user_id,
-                session_id=session_id,
-                state={}
+        try:
+            # Build system prompt with current context
+            system_prompt = self._build_system_prompt(session_id)
+            
+            # Call Claude to analyze the request and determine actions
+            analysis_response = self.client.messages.create(
+                model=self.model,
+                max_tokens=2000,
+                system=system_prompt,
+                messages=[{
+                    "role": "user", 
+                    "content": f"Analyze this request and determine what actions to take: {query}"
+                }]
             )
-        # 2) Wrap user text into Content object for Gemini
-        content = types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=query)]
-        )
-        # 🚀 Run the agent using the Runner and collect the last event
-        last_event = None
-        async for event in self._runner.run_async(
-            user_id=self._user_id,
-            session_id=session.id,
-            new_message=content
-        ):
-            last_event = event
+            
+            analysis = analysis_response.content[0].text if analysis_response.content else ""
+            logger.info(f"Claude analysis: {analysis}")
+            
+            # Execute the plan based on Claude's analysis
+            result = await self._execute_plan(query, analysis, session_id)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"ClaudeOrchestratorAgent error: {e}")
+            return f"Orchestration error: {str(e)}"
 
-        # 🧹 Fallback: return empty string if something went wrong
-        if not last_event or not last_event.content or not last_event.content.parts:
-            return ""
+    async def _execute_plan(self, original_query: str, analysis: str, session_id: str) -> str:
+        """
+        Execute the orchestration plan based on Claude's analysis.
+        """
+        try:
+            # For deployment requests, coordinate PlannerAgent → ExecutorAgent
+            if any(keyword in original_query.lower() for keyword in ['deploy', 'deployment']):
+                return await self._handle_deployment_workflow(original_query, session_id)
+            
+            # For assessment requests, just use PlannerAgent
+            elif any(keyword in original_query.lower() for keyword in ['assess', 'check', 'status', 'ready']):
+                return await self._delegate_task("PlannerAgent", original_query, session_id)
+            
+            # For time requests, use TellTimeAgent
+            elif any(keyword in original_query.lower() for keyword in ['time', 'date']):
+                return await self._delegate_task("TellTimeAgent", original_query, session_id)
+            
+            # For greetings, use GreetingAgent
+            elif any(keyword in original_query.lower() for keyword in ['greet', 'hello', 'hi']):
+                return await self._delegate_task("GreetingAgent", original_query, session_id)
+            
+            # Otherwise, let Claude decide based on analysis
+            else:
+                return await self._handle_general_query(original_query, analysis, session_id)
+                
+        except Exception as e:
+            logger.error(f"Error executing plan: {e}")
+            return f"Error executing orchestration plan: {str(e)}"
 
-        # 📤 Extract and join all text responses into one string
-        return "\n".join([p.text for p in last_event.content.parts if p.text])
+    async def _handle_deployment_workflow(self, query: str, session_id: str) -> str:
+        """
+        Handle Monte Carlo deployment workflow: PlannerAgent → ExecutorAgent
+        """
+        try:
+            # Step 1: Get cluster assessment from PlannerAgent
+            logger.info("Step 1: Getting cluster assessment from PlannerAgent")
+            assessment = await self._delegate_task("PlannerAgent", query, session_id)
+            
+            # Step 2: If assessment is positive, proceed with ExecutorAgent
+            if any(keyword in assessment.lower() for keyword in ['ready', 'healthy', 'accessible']):
+                logger.info("Step 2: Cluster ready, proceeding with deployment via ExecutorAgent")
+                deployment = await self._delegate_task("ExecutorAgent", query, session_id)
+                
+                return f"**Monte Carlo Deployment Workflow Complete**\n\n**Assessment Results:**\n{assessment}\n\n**Deployment Results:**\n{deployment}"
+            else:
+                return f"**Monte Carlo Deployment Workflow - Assessment Failed**\n\n**Assessment Results:**\n{assessment}\n\n**Recommendation:** Resolve assessment issues before proceeding with deployment."
+            
+        except Exception as e:
+            logger.error(f"Error in deployment workflow: {e}")
+            return f"Error in deployment workflow: {str(e)}"
+
+    async def _handle_general_query(self, query: str, analysis: str, session_id: str) -> str:
+        """
+        Handle general queries based on Claude's analysis.
+        """
+        # This could be enhanced to parse Claude's analysis and extract specific tool calls
+        # For now, provide a helpful response
+        available_agents = self._get_available_agents()
+        return f"I can help coordinate between these agents: {', '.join(available_agents)}. Please specify what you'd like me to help with:\n\n- Monte Carlo deployment: 'Deploy Monte Carlo to [namespace]'\n- Cluster assessment: 'Assess cluster for [namespace]'\n- Current time: 'What time is it?'\n- Greetings: 'Greet me'\n\nYour query: {query}"
 
 
-class OrchestratorTaskManager(InMemoryTaskManager):
+class ClaudeOrchestratorTaskManager(InMemoryTaskManager):
     """
-    TaskManager wrapper: exposes OrchestratorAgent.invoke()
+    TaskManager wrapper: exposes ClaudeOrchestratorAgent.invoke()
     over the `tasks/send` JSON-RPC endpoint.
     """
-    def __init__(self, agent: OrchestratorAgent):
-        super().__init__()             # Initialize in-memory store and lock
-        self.agent = agent             # Store reference to orchestrator logic
+    def __init__(self, agent: ClaudeOrchestratorAgent):
+        super().__init__()
+        self.agent = agent
 
     def _get_user_text(self, request: SendTaskRequest) -> str:
-        """
-        Helper: extract raw user text from JSON-RPC request.
-
-        Args:
-            request (SendTaskRequest): Incoming RPC request.
-
-        Returns:
-            str: The text from the request payload.
-        """
+        """Extract raw user text from JSON-RPC request."""
         return request.params.message.parts[0].text
 
     async def on_send_task(self, request: SendTaskRequest) -> SendTaskResponse:
@@ -284,17 +277,22 @@ class OrchestratorTaskManager(InMemoryTaskManager):
           3) Append the reply, mark task COMPLETED
           4) Return the full Task in the response
         """
-        logger.info(f"OrchestratorTaskManager received task {request.params.id}")
+        logger.info(f"ClaudeOrchestratorTaskManager received task {request.params.id}")
+        
         # Store or update the task record
         task = await self.upsert_task(request.params)
+        
         # Extract the text and invoke orchestration logic
         user_text = self._get_user_text(request)
         reply_text = await self.agent.invoke(user_text, request.params.sessionId)
+        
         # Wrap reply in a Message object
         msg = Message(role="agent", parts=[TextPart(text=reply_text)])
+        
         # Safely append reply and update status under lock
         async with self.lock:
             task.status = TaskStatus(state=TaskState.COMPLETED)
             task.history.append(msg)
+        
         # Return the RPC response including the updated task
         return SendTaskResponse(id=request.id, result=task)

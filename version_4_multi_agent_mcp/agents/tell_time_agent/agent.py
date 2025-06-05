@@ -1,136 +1,101 @@
 # =============================================================================
-# agents/google_adk/agent.py
+# agents/tell_time_agent/agent.py - Claude Integration (Clean)
 # =============================================================================
 # 🎯 Purpose:
-# This file defines a very simple AI agent called TellTimeAgent.
-# It uses Google's ADK (Agent Development Kit) and Gemini model to respond with the current time.
+# Replace Google ADK + Gemini with Anthropic + Claude Sonnet 4
+# Keep the exact same interface as the original TellTimeAgent
 # =============================================================================
 
-
-# -----------------------------------------------------------------------------
-# 📦 Built-in & External Library Imports
-# -----------------------------------------------------------------------------
-
-from datetime import datetime  # Used to get the current system time
-
-# 🧠 Gemini-based AI agent provided by Google's ADK
-from google.adk.agents.llm_agent import LlmAgent
-
-# 📚 ADK services for session, memory, and file-like "artifacts"
-from google.adk.sessions import InMemorySessionService
-from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
-from google.adk.artifacts import InMemoryArtifactService
-
-# 🏃 The "Runner" connects the agent, session, memory, and files into a complete system
-from google.adk.runners import Runner
-
-# 🧾 Gemini-compatible types for formatting input/output messages
-from google.genai import types
-
-# 🔐 Load environment variables (like API keys) from a `.env` file
+import os
+import logging
+from datetime import datetime
+import anthropic
 from dotenv import load_dotenv
-load_dotenv()  # Load variables like GOOGLE_API_KEY into the system
-# This allows you to keep sensitive data out of your code.
 
+# Load environment variables 
+load_dotenv()
 
-# -----------------------------------------------------------------------------
-# 🕒 TellTimeAgent: Your AI agent that tells the time
-# -----------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
 
 class TellTimeAgent:
-    # This agent only supports plain text input/output
+    """
+    🕒 Simple agent that tells the current time using Claude Sonnet 4
+    Replaces the original Gemini-based implementation but keeps same interface
+    """
+    
+    # Keep the same supported content types as original
     SUPPORTED_CONTENT_TYPES = ["text", "text/plain"]
 
     def __init__(self):
         """
-        👷 Initialize the TellTimeAgent:
-        - Creates the LLM agent (powered by Gemini)
-        - Sets up session handling, memory, and a runner to execute tasks
+        Initialize Claude client instead of Google ADK components
         """
-        self._agent = self._build_agent()  # Set up the Gemini agent
-        self._user_id = "time_agent_user"  # Use a fixed user ID for simplicity
-
-        # 🧠 The Runner is what actually manages the agent and its environment
-        self._runner = Runner(
-            app_name=self._agent.name,
-            agent=self._agent,
-            artifact_service=InMemoryArtifactService(),  # For files (not used here)
-            session_service=InMemorySessionService(),    # Keeps track of conversations
-            memory_service=InMemoryMemoryService(),      # Optional: remembers past messages
-        )
-
-    def _build_agent(self) -> LlmAgent:
-        """
-        ⚙️ Creates and returns a Gemini agent with basic settings.
-
-        Returns:
-            LlmAgent: An agent object from Google's ADK
-        """
-        return LlmAgent(
-            model="gemini-1.5-flash-latest",         # Gemini model version
-            name="tell_time_agent",                  # Name of the agent
-            description="Tells the current time",    # Description for metadata
-            instruction="Reply with the current time in the format YYYY-MM-DD HH:MM:SS."  # System prompt
-        )
+        # Initialize Claude client
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY environment variable is required")
+        
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.model = "claude-sonnet-4-20250514"
+        
+        logger.info(f"TellTimeAgent initialized with Claude Sonnet 4")
 
     async def invoke(self, query: str, session_id: str) -> str:
         """
-        📥 Handle a user query and return a response string.
-
+        Handle a user query and return a response string.
+        Same interface as original Gemini agent.
+        
         Args:
             query (str): What the user said (e.g., "what time is it?")
             session_id (str): Helps group messages into a session
-
+            
         Returns:
-            str: Agent's reply (usually the current time)
+            str: Agent's reply with the current time
         """
-
-        # 🔁 Try to reuse an existing session (or create one if needed)
-        session = await self._runner.session_service.get_session(
-            app_name=self._agent.name,
-            user_id=self._user_id,
-            session_id=session_id
-        )
-
-        if session is None:
-            session = await self._runner.session_service.create_session(
-                app_name=self._agent.name,
-                user_id=self._user_id,
-                session_id=session_id,
-                state={}  # Optional dictionary to hold session state
+        
+        try:
+            # Get current time
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Create system prompt similar to original instruction
+            system_prompt = f"""You are a time-telling agent. 
+            The current time is: {current_time}
+            Reply with the current time in the format YYYY-MM-DD HH:MM:SS.
+            Be helpful and friendly in your response."""
+            
+            # Call Claude API
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=1000,
+                system=system_prompt,
+                messages=[{
+                    "role": "user", 
+                    "content": query
+                }]
             )
-
-        # 📨 Format the user message in a way the Gemini model expects
-        content = types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=query)]
-        )
-
-        # 🚀 Run the agent using the Runner and collect the last event
-        last_event = None
-        async for event in self._runner.run_async(
-            user_id=self._user_id,
-            session_id=session.id,
-            new_message=content
-        ):
-            last_event = event
-
-        # 🧹 Fallback: return empty string if something went wrong
-        if not last_event or not last_event.content or not last_event.content.parts:
-            return ""
-
-        # 📤 Extract and join all text responses into one string
-        return "\n".join([p.text for p in last_event.content.parts if p.text])
+            
+            # Extract text from response
+            if response.content and len(response.content) > 0:
+                return response.content[0].text
+            else:
+                return f"The current time is: {current_time}"
+                
+        except Exception as e:
+            logger.error(f"TellTimeAgent error: {e}")
+            # Fallback to simple time response
+            return f"The current time is: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
     async def stream(self, query: str, session_id: str):
         """
-        🌀 Simulates a "streaming" agent that returns a single reply.
-        This is here just to demonstrate that streaming is possible.
-
+        Simulates a "streaming" agent that returns a single reply.
+        Keep same interface as original for compatibility.
+        
         Yields:
-            dict: Response payload that says the task is complete and gives the time
+            dict: Response payload with completion status and time
         """
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
         yield {
             "is_task_complete": True,
-            "content": f"The current time is: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            "content": f"The current time is: {current_time}"
         }

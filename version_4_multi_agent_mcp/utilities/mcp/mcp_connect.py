@@ -5,6 +5,7 @@
 #   Connect to each MCP server defined in mcp_config.json,
 #   open ephemeral sessions to list available tools, and
 #   provide an easy interface to call those tools on demand.
+#   FIXED: Now properly handles environment variable expansion from config
 # =============================================================================
 
 import os  # For accessing environment variables and file paths
@@ -44,7 +45,8 @@ class MCPTool:
         description: str,
         input_schema: dict,
         server_cmd: str,
-        server_args: list[str]
+        server_args: list[str],
+        server_env: dict = None
     ):
         # Store the tool's name and description for later reference
         self.name = name
@@ -52,9 +54,11 @@ class MCPTool:
         # Save the JSON schema to validate the `args` passed to run()
         self.input_schema = input_schema
         # Prepare stdio connection params so we can spawn the server on each call
+        # FIXED: Now includes environment variables
         self._params = StdioServerParameters(
             command=server_cmd,
-            args=server_args
+            args=server_args,
+            env=server_env if server_env else None
         )
 
     async def run(self, args: dict) -> str:
@@ -84,6 +88,7 @@ class MCPConnector:
     """
     🔗 Discovers MCP servers from config, lists each server's tools,
     and caches them as MCPTool instances for easy lookup.
+    FIXED: Now properly handles environment variable expansion
 
     Usage:
         connector = MCPConnector()
@@ -98,10 +103,32 @@ class MCPConnector:
         # Load tools from all configured MCP servers immediately
         self._load_all_tools()
 
+    def _expand_environment_variables(self, env_vars: dict) -> dict:
+        """
+        Expand environment variable placeholders like ${AAP_TOKEN}
+        Based on the pattern from your test_mcp_connections.py
+        """
+        expanded_env = {}
+        for key, value in env_vars.items():
+            if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+                # Extract env var name: ${AAP_TOKEN} -> AAP_TOKEN
+                env_var_name = value[2:-1]
+                expanded_value = os.getenv(env_var_name)
+                if expanded_value:
+                    expanded_env[key] = expanded_value
+                    logger.info(f"[MCPConnector] Expanded {key} from ${env_var_name}")
+                else:
+                    logger.warning(f"[MCPConnector] Environment variable {env_var_name} not found")
+                    expanded_env[key] = value  # Keep original value
+            else:
+                expanded_env[key] = value
+        return expanded_env
+
     def _load_all_tools(self):
         """
         Internal helper: runs an async routine synchronously to fetch
         and cache tool definitions from every MCP server.
+        FIXED: Now handles environment variables properly
         """
         # Define the async function that does the work
         async def _fetch():
@@ -112,9 +139,26 @@ class MCPConnector:
                 # Extract the command (e.g., "python script.py") and args
                 cmd = info.get("command")
                 args = info.get("args", [])
+                env_vars = info.get("env", {})
+                
                 logger.info(f"[MCPConnector] Fetching tools from MCP server: {name}")
-                # Prepare parameters for stdio_client
-                params = StdioServerParameters(command=cmd, args=args)
+                
+                if not cmd:
+                    logger.warning(f"[MCPConnector] No command specified for {name}")
+                    continue
+
+                # FIXED: Handle environment variable expansion
+                expanded_env = {}
+                if env_vars:
+                    expanded_env = self._expand_environment_variables(env_vars)
+                
+                # Prepare parameters for stdio_client with environment
+                params = StdioServerParameters(
+                    command=cmd,
+                    args=args,
+                    env=expanded_env if expanded_env else None
+                )
+                
                 try:
                     # Open a stdio connection to the MCP server
                     async with stdio_client(params) as (r, w):
@@ -132,7 +176,8 @@ class MCPConnector:
                                         description=t.description,
                                         input_schema=t.inputSchema,
                                         server_cmd=cmd,
-                                        server_args=args
+                                        server_args=args,
+                                        server_env=expanded_env if expanded_env else None
                                     )
                                 )
                             logger.info(
@@ -143,6 +188,12 @@ class MCPConnector:
                     logger.warning(
                         f"[MCPConnector] Failed to list tools from {name}: {e}"
                     )
+                    # Print more details for debugging
+                    if "AAP_TOKEN" in str(e):
+                        logger.warning(f"[MCPConnector] Make sure AAP_TOKEN is set in your environment")
+                        logger.warning(f"[MCPConnector] Check: echo $AAP_TOKEN")
+                    elif "command not found" in str(e) or "No such file" in str(e):
+                        logger.warning(f"[MCPConnector] Check that command exists: {cmd}")
 
         # Run the async fetch coroutine in a new event loop
         asyncio.run(_fetch())
