@@ -184,7 +184,33 @@ class ExecutorAgent:
             
             if job_result.get('success'):
                 job_data = job_result['data']
-                job_id = job_data.get('id') if isinstance(job_data, dict) else None
+                logger.info(f"Raw job_data from AAP: {job_data}")
+                logger.info(f"job_data type: {type(job_data)}")
+                
+                # Handle different response formats from MCP
+                job_id = None
+                if isinstance(job_data, dict):
+                    job_id = job_data.get('id')
+                elif hasattr(job_data, 'text'):
+                    # Parse JSON from text response
+                    try:
+                        parsed_data = json.loads(job_data.text)
+                        job_id = parsed_data.get('id')
+                        job_data = parsed_data
+                    except:
+                        logger.error(f"Failed to parse job_data.text: {job_data.text}")
+                elif isinstance(job_data, list) and len(job_data) > 0:
+                    # Handle list response format
+                    first_item = job_data[0]
+                    if hasattr(first_item, 'text'):
+                        try:
+                            parsed_data = json.loads(first_item.text)
+                            job_id = parsed_data.get('id')
+                            job_data = parsed_data
+                        except:
+                            logger.error(f"Failed to parse list item text: {first_item.text}")
+                
+                logger.info(f"Extracted job_id: {job_id}")
                 
                 return {
                     "started": True,
@@ -204,12 +230,42 @@ class ExecutorAgent:
         """
         try:
             status_result = await self._call_ansible_tool('job_status', {'job_id': job_id})
+            logger.info(f"Raw job_status response: {status_result}")
+            
             if status_result.get('success'):
-                return {"success": True, "status": status_result['data']}
+                status_data = status_result['data']
+                logger.info(f"Status data type: {type(status_data)}")
+                logger.info(f"Status data: {status_data}")
+                
+                # Handle different response formats
+                parsed_status = None
+                if isinstance(status_data, dict):
+                    parsed_status = status_data
+                elif hasattr(status_data, 'text'):
+                    try:
+                        parsed_status = json.loads(status_data.text)
+                    except:
+                        logger.error(f"Failed to parse status_data.text: {status_data.text}")
+                elif isinstance(status_data, list) and len(status_data) > 0:
+                    first_item = status_data[0]
+                    if hasattr(first_item, 'text'):
+                        try:
+                            parsed_status = json.loads(first_item.text)
+                        except:
+                            logger.error(f"Failed to parse list item text: {first_item.text}")
+                    elif isinstance(first_item, dict):
+                        parsed_status = first_item
+                
+                if parsed_status:
+                    return {"success": True, "status": parsed_status}
+                else:
+                    return {"success": False, "error": f"Unable to parse status data: {status_data}"}
             else:
                 return {"success": False, "error": status_result.get('error')}
         except Exception as e:
             logger.error(f"Error checking job status: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return {"success": False, "error": str(e)}
     
     async def invoke(self, query: str, session_id: str) -> str:
@@ -237,14 +293,17 @@ class ExecutorAgent:
                 template_result = await self._find_monte_carlo_template()
                 
                 if not template_result.get('found'):
-                    system_prompt = f"""You are an Ansible AAP deployment executor.
+                    return f"""## ❌ Deployment Failed - Template Not Found
 
-Template Search Results:
-- Monte Carlo Template Found: NO
-- Error: {template_result.get('error', 'Unknown error')}
-- Available Templates: {template_result.get('available_templates', [])}
+**Error:** MonteCarlo Application template not found in Ansible AAP
+**Available Templates:** {', '.join(template_result.get('available_templates', []))}
 
-Explain that the MonteCarlo Application template was not found and list available templates."""
+**Troubleshooting Steps:**
+1. Verify the 'MonteCarlo Application' job template exists in AAP
+2. Check template permissions and availability
+3. Contact Ansible AAP administrator if template is missing
+
+**Error Details:** {template_result.get('error', 'Unknown error')}"""
                 
                 else:
                     # Template found, attempt deployment
@@ -255,23 +314,59 @@ Explain that the MonteCarlo Application template was not found and list availabl
                     
                     if deploy_result.get('started'):
                         job_id = deploy_result['job_id']
-                        system_prompt = f"""You are an Ansible AAP deployment executor.
+                        
+                        # Get AAP URL from environment or use default
+                        aap_url = os.getenv('AAP_URL', 'https://aap-aap.apps.cluster-zkwsn.dynamic.redhatworkshops.io')
+                        job_url = f"{aap_url}/execution/jobs/playbook/{job_id}/output"
+                        
+                        return f"""## ✅ Deployment Started Successfully
 
-Deployment Started Successfully:
-- Template: {template_name} (ID: {template_id})
-- Job ID: {job_id}
-- Target Namespace: {namespace or 'default from playbook'}
-- Status: DEPLOYMENT STARTED
+**Ansible AAP Deployment Executor Report**
+---
 
-Provide a success message with the job ID for tracking."""
+### 📋 Deployment Details
+- **Template**: {template_name} (ID: {template_id})
+- **Target Namespace**: `{namespace or 'default'}`
+- **Status**: 🚀 **DEPLOYMENT STARTED**
+- **Job ID**: `{job_id}`
+- **Monitor URL**: {job_url}
+
+---
+
+### 🎯 Success Message
+The Monte Carlo application deployment has been **successfully initiated** to the `{namespace or 'default'}` namespace.
+
+**Tracking Information:**
+- **Job ID**: `{job_id}`
+- **Template ID**: {template_id}
+- **Deployment Type**: Monte Carlo Risk Simulation Application
+- **Monitor Progress**: {job_url}
+
+You can monitor the deployment progress in real-time at: {job_url}
+
+---
+
+### 📊 Next Steps
+- Monitor deployment status via Job ID: {job_id}
+- Check progress at: {job_url}
+- Verify application health post-deployment
+- Check namespace resources and pod status
+
+**Deployment tracking ID**: `{job_id}` ✨"""
                     else:
-                        system_prompt = f"""You are an Ansible AAP deployment executor.
+                        return f"""## ❌ Deployment Failed to Start
 
-Deployment Failed to Start:
-- Template: {template_name} (ID: {template_id})
-- Error: {deploy_result.get('error')}
+**Template:** {template_name} (ID: {template_id})
+**Target Namespace:** {namespace or 'default'}
+**Error:** {deploy_result.get('error')}
 
-Explain the deployment failure and suggest troubleshooting steps."""
+**Troubleshooting Steps:**
+1. Check Ansible AAP connectivity
+2. Verify template permissions
+3. Review job template configuration
+4. Check inventory and credential settings
+
+**Support:** Contact Platform Engineering for assistance"""
             
             else:
                 # Handle job status checks or general queries
@@ -286,53 +381,66 @@ Explain the deployment failure and suggest troubleshooting steps."""
                     
                     if job_id:
                         status_result = await self._check_job_status(job_id)
-                        system_prompt = f"""You are an Ansible AAP deployment executor.
+                        if status_result.get('success'):
+                            status_data = status_result['status']
+                            job_status = status_data.get('status', 'Unknown')
+                            job_started = status_data.get('started', 'N/A')
+                            job_finished = status_data.get('finished', 'N/A')
+                            
+                            return f"""## 📊 Job Status Report
 
-Job Status Check for Job ID {job_id}:
-- Status Result: {status_result}
+**Job ID:** {job_id}
+**Status:** {job_status}
+**Started:** {job_started}
+**Finished:** {job_finished}
 
-Report the current job status clearly."""
+**Raw Details:** {status_data}
+
+**AAP Monitor:** {os.getenv('AAP_URL', 'https://aap-aap.apps.cluster-zkwsn.dynamic.redhatworkshops.io')}/execution/jobs/playbook/{job_id}/output"""
+                        else:
+                            return f"""## ❌ Job Status Check Failed
+
+**Job ID:** {job_id}
+**Error:** {status_result.get('error')}
+
+**Troubleshooting:**
+- Verify job ID {job_id} exists in Ansible AAP
+- Check AAP connectivity and MCP tools
+- Review agent logs for detailed error information
+
+**AAP Monitor:** {os.getenv('AAP_URL', 'https://aap-aap.apps.cluster-zkwsn.dynamic.redhatworkshops.io')}/execution/jobs/playbook/{job_id}/output"""
                     else:
-                        system_prompt = """You are an Ansible AAP deployment executor.
+                        return """## 📊 Job Status Check
 
-I can deploy Monte Carlo applications using Ansible AAP. 
+To check job status, please provide a job ID:
+- "Check job status 4"
+- "Status of job 123"
 
-Commands:
-- "Deploy Monte Carlo application" - Start deployment
-- "Check job status 123" - Check specific job status
-- "Deploy Monte Carlo to monte-carlo-prod namespace" - Deploy to specific namespace"""
+I can also start new deployments:
+- "Deploy Monte Carlo application"
+- "Deploy Monte Carlo to monte-carlo-prod namespace" """
                 else:
-                    system_prompt = """You are an Ansible AAP deployment executor for Monte Carlo applications.
+                    return """## 🚀 Ansible AAP Deployment Executor
 
 I can execute Monte Carlo deployments using Ansible AAP job templates.
 
-Example commands:
-- "Deploy Monte Carlo application" 
-- "Deploy Monte Carlo to namespace monte-carlo-staging"
-- "Check status of job 123"
+**Available Commands:**
+- **Deploy:** "Deploy Monte Carlo application" 
+- **Deploy to Namespace:** "Deploy Monte Carlo to namespace monte-carlo-staging"
+- **Check Status:** "Check status of job 123"
+- **List Jobs:** "Show recent jobs"
+
+**Capabilities:**
+- ✅ Execute Monte Carlo deployment jobs
+- ✅ Monitor job status and progress
+- ✅ Target specific namespaces
+- ✅ Provide real-time job tracking
 
 How can I help with your deployment?"""
-            
-            # Call Claude API - same pattern as your tell_time_agent
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=2000,
-                system=system_prompt,
-                messages=[{
-                    "role": "user", 
-                    "content": query
-                }]
-            )
-            
-            # Extract text from response - same as your pattern
-            if response.content and len(response.content) > 0:
-                return response.content[0].text
-            else:
-                return "I can help deploy Monte Carlo applications using Ansible AAP. Please specify your deployment request."
                 
         except Exception as e:
             logger.error(f"ExecutorAgent error: {e}")
-            return f"Error executing deployment: {str(e)}. Please check AAP connectivity and try again."
+            return f"## ❌ Deployment Executor Error\n\nError executing deployment: {str(e)}\n\n**Troubleshooting:**\n- Check AAP connectivity\n- Verify MCP tools are available\n- Review agent logs for details"
     
     async def stream(self, query: str, session_id: str):
         """
