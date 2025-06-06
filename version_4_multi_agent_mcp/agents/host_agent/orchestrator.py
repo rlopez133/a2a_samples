@@ -286,7 +286,7 @@ Return ONLY the JSON array:"""
             if not workflow_steps:
                 return "Error: No workflow steps generated"
 
-            logger.info(f"Generated practical hybrid workflow with {len(workflow_steps)} steps")
+            logger.info(f"Generated workflow with {len(workflow_steps)} steps")
 
             # Execute the workflow with smart ServiceNow progression
             return await self._execute_workflow_with_progression(query, workflow_steps, namespace, session_id)
