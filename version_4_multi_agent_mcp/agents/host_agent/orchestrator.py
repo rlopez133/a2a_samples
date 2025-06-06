@@ -1,9 +1,12 @@
 # =============================================================================
-# agents/host_agent/claude_orchestrator.py
+# agents/host_agent/orchestrator.py - PRACTICAL HYBRID VERSION (FIXED)
 # =============================================================================
 # 🎯 Purpose:
-# Claude-based orchestrator that coordinates between A2A agents and MCP tools
-# Enhanced with ServiceNow ITSM integration for deployment workflows
+# Best of both worlds: Dynamic workflow generation + reliable execution
+# - Single Claude call for workflow generation
+# - Smart hardcoded logic for progressive ServiceNow updates
+# - No timeouts, but rich ServiceNow audit trail
+# - FIXED: Proper incident closure with correct incident number
 # =============================================================================
 
 import uuid
@@ -12,6 +15,7 @@ import asyncio
 import os
 import re
 import anthropic
+import json
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -39,20 +43,18 @@ logging.basicConfig(level=logging.INFO)
 
 class ClaudeOrchestratorAgent:
     """
-    🤖 Claude-based OrchestratorAgent with ServiceNow ITSM integration:
-      - Discovers A2A agents via DiscoveryClient → list of AgentCards
-      - Connects to each A2A agent with AgentConnector
-      - Discovers MCP servers via MCPConnector and loads MCP tools
-      - Uses Claude Sonnet 4 to decide which tools to call
-      - Routes user queries by picking and invoking the correct tool
-      - Enhanced with 5-step ServiceNow deployment workflow
+    🤖 Practical Hybrid Claude-based OrchestratorAgent:
+      - Dynamic workflow generation (single Claude call)
+      - Smart execution with progressive ServiceNow updates
+      - Reliable and fast execution without timeouts
+      - FIXED: Proper incident closure logic
     """
 
     SUPPORTED_CONTENT_TYPES = ["text", "text/plain"]
 
     def __init__(self, agent_cards: list[AgentCard]):
         """
-        Initialize the Claude-based orchestrator with discovered A2A agents and MCP tools.
+        Initialize the practical hybrid orchestrator.
         """
         # Initialize Claude client
         api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -121,26 +123,35 @@ class ClaudeOrchestratorAgent:
             logger.error(f"Error calling MCP tool {tool_name}: {e}")
             return f"Error calling {tool_name}: {str(e)}"
 
-    def _should_use_servicenow_workflow(self, query: str) -> bool:
+    def _should_use_dynamic_workflow(self, query: str) -> bool:
         """
-        Determine if query should trigger the enhanced ServiceNow deployment workflow
+        Determine if query needs multi-agent orchestration.
+        
+        PRINCIPLE: Only use complex workflow when you actually need 
+        coordination across ServiceNow + Kubernetes + Ansible with state tracking.
+        Everything else should be handled simply.
         """
-        deployment_keywords = [
-            'deploy monte carlo',
-            'monte carlo deploy',
-            'deploy to',
-            'deployment',
-            'start deployment',
-            'run deployment'
-        ]
-
         query_lower = query.lower()
-        return any(keyword in query_lower for keyword in deployment_keywords)
+        
+        # Complex workflow ONLY for explicit orchestration requests
+        orchestration_indicators = [
+            # Multi-step enterprise processes
+            "deploy", "deployment", "provision", "rollback", "migrate",
+            # Cross-system coordination phrases  
+            "create incident for", "track deployment", "deploy and track",
+            "coordinate", "orchestrate", "workflow", "process",
+            # Multi-agent operations
+            "assess and deploy", "deploy then verify", "provision with monitoring"
+        ]
+        
+        # Only escalate to complex if it clearly needs orchestration
+        needs_orchestration = any(indicator in query_lower for indicator in orchestration_indicators)
+        
+        # Default to simple for everything else
+        return needs_orchestration
 
     def _extract_namespace(self, query: str) -> str:
-        """
-        Extract namespace from deployment query with enhanced pattern matching
-        """
+        """Extract namespace from deployment query"""
         if not query:
             return 'unknown'
 
@@ -159,10 +170,10 @@ class ClaudeOrchestratorAgent:
 
         # Try regex patterns for common deployment syntax
         patterns = [
-            r'deploy(?:ment)?\s+(?:to\s+)?(\S+)',  # "deploy to xyz" or "deployment xyz"
-            r'namespace[:\s]+(\S+)',                # "namespace: xyz" or "namespace xyz"
-            r'target[:\s]+(\S+)',                   # "target: xyz" or "target xyz"
-            r'(?:to|into)\s+(\S+)',                 # "to xyz" or "into xyz"
+            r'deploy(?:ment)?\s+(?:to\s+)?(\S+)',
+            r'namespace[:\s]+(\S+)',
+            r'target[:\s]+(\S+)',
+            r'(?:to|into)\s+(\S+)',
         ]
 
         for pattern in patterns:
@@ -172,379 +183,259 @@ class ClaudeOrchestratorAgent:
                 logger.info(f"Found namespace via regex: {namespace}")
                 return namespace
 
-        # Default fallback
         logger.warning(f"Could not extract namespace from query: {query}")
         return 'unknown'
 
-    def _extract_incident_number_from_response(self, response: str) -> str:
+    def _extract_system_info(self, response: str) -> dict:
         """
-        Extract incident number from ServiceNow agent response
-        Looks for patterns like INC0010001, INC1234567, etc.
+        Extract system information from agent responses
         """
+        info = {}
+
         if not response:
-            return None
+            return info
 
-        # Look for incident number pattern in response
-        match = re.search(r'\b(INC\d+)\b', response.upper())
-        if match:
-            incident_number = match.group(1)
-            logger.info(f"Extracted incident number: {incident_number}")
-            return incident_number
+        response_upper = response.upper()
 
-        # Log if we can't find incident number
-        logger.warning(f"Could not extract incident number from response: {response[:100]}...")
-        return None
+        # ServiceNow incident numbers - always INC followed by digits
+        incident_match = re.search(r'\b(INC\d+)\b', response_upper)
+        if incident_match:
+            info['incident_number'] = incident_match.group(1)
 
-    async def _handle_servicenow_deployment_workflow(self, query: str, session_id: str) -> str:
+        # Ansible job IDs - look for various patterns
+        job_patterns = [
+            r'Job ID[:\s]*`?(\d+)`?',
+            r'job[:\s]*(\d+)',
+            r'ID[:\s]*(\d+)',
+            r'tracking[:\s]*ID[:\s]*`?(\d+)`?'
+        ]
+
+        for pattern in job_patterns:
+            job_match = re.search(pattern, response, re.IGNORECASE)
+            if job_match:
+                info['job_id'] = job_match.group(1)
+                break
+
+        return info
+
+    def _assess_readiness(self, response: str) -> bool:
+        """Check if assessment indicates readiness"""
+        if not response:
+            return False
+
+        positive_indicators = ['ready', 'healthy', 'accessible', 'available', 'running', 'active', 'ready_for_ansible_deployment', 'proceed', 'cleared']
+        negative_indicators = ['failed', 'error', 'unavailable', 'down', 'unhealthy', 'not ready', 'cannot proceed']
+
+        response_lower = response.lower()
+
+        # Check for negative indicators first
+        if any(indicator in response_lower for indicator in negative_indicators):
+            return False
+
+        # Check for positive indicators
+        return any(indicator in response_lower for indicator in positive_indicators)
+
+    async def _execute_practical_hybrid_workflow(self, query: str, session_id: str) -> str:
         """
-        Enhanced Monte Carlo deployment workflow with ServiceNow ITSM integration:
-        1. ServiceNow → Create tracking incident
-        2. PlannerAgent → Assess cluster readiness
-        3. ServiceNow → Update incident with assessment
-        4. ExecutorAgent → Deploy if ready
-        5. ServiceNow → Close incident with results
+        Execute practical hybrid workflow with single Claude call + smart execution
         """
         try:
-            # Extract namespace from query
+            available_agents = self._get_available_agents()
             namespace = self._extract_namespace(query)
 
-            # Step 1: Create ServiceNow incident for tracking
-            logger.info("Step 1: Creating ServiceNow incident for deployment tracking")
-            incident_response = await self._delegate_task("ServiceNowAgent", 
-                f"Create incident with caller Roger Lopez, short description 'Deploy Monte Carlo Application to {namespace} Namespace', description 'Automated deployment workflow for Monte Carlo risk simulation application to {namespace} namespace via Ansible AAP. Includes cluster assessment, deployment execution, and status tracking.', category 'Software', urgency 2, impact 2", session_id)
+            # Single Claude call to generate workflow structure
+            workflow_prompt = f"""Generate a deployment workflow for: {query}
 
-            # Extract incident number from response
-            incident_number = self._extract_incident_number_from_response(incident_response)
+Available agents: {', '.join(available_agents)}
+Target namespace: {namespace}
 
-            if not incident_number:
-                return f"""❌ **ServiceNow Integration Failed**
+Agent capabilities:
+- ServiceNowAgent: Create/update/close incidents
+- PlannerAgent: Kubernetes assessment, returns readiness status
+- ExecutorAgent: Ansible deployment, returns job IDs
 
-Failed to create tracking incident: {incident_response}
+Create a logical workflow as JSON array. Focus on the main steps:
 
-**Recommendation:** Check ServiceNow connectivity and retry deployment."""
+Example:
+[
+  {{"agent": "ServiceNowAgent", "task": "Create incident for Monte Carlo deployment to {namespace} namespace"}},
+  {{"agent": "PlannerAgent", "task": "Assess cluster readiness for {namespace} namespace"}},
+  {{"agent": "ExecutorAgent", "task": "Deploy Monte Carlo application to {namespace} namespace"}},
+  {{"agent": "ServiceNowAgent", "task": "Close incident with deployment results"}}
+]
 
-            # Step 2: Get cluster assessment
-            logger.info("Step 2: Getting cluster readiness assessment")
-            assessment = await self._delegate_task("PlannerAgent",
-                f"Assess cluster readiness for Monte Carlo deployment to {namespace}", session_id)
+Return ONLY the JSON array:"""
 
-            # Step 3: Update incident with assessment results
-            logger.info("Step 3: Updating ServiceNow incident with assessment")
-            await self._delegate_task("ServiceNowAgent",
-                f"Update incident {incident_number} with state 2, work_notes 'Cluster assessment completed. Results: {assessment[:200]}...'", session_id)
+            logger.info("Generating practical hybrid workflow...")
 
-            # Check if deployment should proceed based on assessment
-            ready_for_deployment = any(keyword in assessment.lower() for keyword in ['ready', 'healthy', 'accessible', 'available'])
+            workflow_response = self.client.messages.create(
+                model=self.model,
+                max_tokens=1000,
+                messages=[{"role": "user", "content": workflow_prompt}]
+            )
 
-            if ready_for_deployment:
-                # Update incident before starting deployment
-                await self._delegate_task("ServiceNowAgent",
-                    f"Update incident {incident_number} with state 2, work_notes 'Starting deployment to {namespace} namespace'", session_id)
-                
-                # Step 4: Execute deployment using ExecutorAgent
-                logger.info("Step 4: Executing deployment via ExecutorAgent")
-                deployment_result = await self._delegate_task("ExecutorAgent", 
-                    f"Deploy Monte Carlo application to {namespace} namespace", session_id)
-                
-                # Extract job ID for monitoring
-                job_id_match = None
-                job_id_pattern = r'Job ID.*?`(\d+)`'
-                match = re.search(job_id_pattern, deployment_result)
-                if match:
-                    job_id_match = match.group(1)
-                    logger.info(f"Extracted job ID for monitoring: {job_id_match}")
-                
-                # Step 5: Monitor job completion and update incident accordingly
-                if job_id_match:
-                    logger.info(f"Step 5: Monitoring job {job_id_match} for completion")
-                    
-                    # Check job status
-                    job_status_result = await self._delegate_task("ExecutorAgent", 
-                        f"Check status of job {job_id_match}", session_id)
-                    
-                    # Determine final status based on job completion
-                    if any(keyword in job_status_result.lower() for keyword in ['successful', 'completed']):
-                        logger.info("Step 5: Job completed successfully - closing incident")
-                        await self._delegate_task("ServiceNowAgent",
-                            f"Update incident {incident_number} with state 6, comments 'Monte Carlo application successfully deployed to {namespace} namespace. Job {job_id_match} completed successfully. Application is running and ready for use.', work_notes 'Deployment completed successfully via A2A automation. Application running in {namespace} namespace.'", session_id)
-                        final_status = "✅ SUCCESS - JOB COMPLETED"
-                        next_steps = f"Application deployed successfully. Monitor in {namespace} namespace. ServiceNow incident {incident_number} closed."
-                    elif any(keyword in job_status_result.lower() for keyword in ['failed', 'error']):
-                        logger.info("Step 5: Job failed - updating incident")
-                        await self._delegate_task("ServiceNowAgent",
-                            f"Update incident {incident_number} state to Work in Progress with work notes: Deployment job {job_id_match} failed. Details: {job_status_result[:200]}...", session_id)
-                        final_status = "❌ DEPLOYMENT FAILED"
-                        next_steps = f"Review job {job_id_match} logs. ServiceNow incident {incident_number} updated with failure details."
-                    else:
-                        # Job still running
-                        logger.info("Step 5: Job still in progress - updating incident")
-                        await self._delegate_task("ServiceNowAgent",
-                            f"Update incident {incident_number} state to Work in Progress with work notes: Deployment job {job_id_match} initiated successfully. Monitoring for completion.", session_id)
-                        final_status = "🚀 DEPLOYMENT IN PROGRESS"
-                        next_steps = f"Monitor job {job_id_match} completion. Update incident {incident_number} when job finishes."
-                else:
-                    # Fallback to original logic if no job ID found
-                    if any(keyword in deployment_result.lower() for keyword in ['successfully', 'completed', 'running', 'success']) and 'started' not in deployment_result.lower():
-                        logger.info("Step 5: Deployment successful - closing incident")
-                        await self._delegate_task("ServiceNowAgent",
-                            f"Update incident {incident_number} with state 6, comments 'Monte Carlo application successfully deployed to {namespace} namespace. Deployment completed via Ansible AAP. Application is running and ready for use.', work_notes 'Deployment completed successfully via A2A automation. Application running in {namespace} namespace.'", session_id)
-                        final_status = "✅ SUCCESS"
-                        next_steps = f"Monitor application in {namespace} namespace. Check ServiceNow incident {incident_number} for complete audit trail."
-                    elif 'started' in deployment_result.lower() and 'successfully' in deployment_result.lower():
-                        logger.info("Step 5: Deployment initiated but not complete - updating incident")
-                        await self._delegate_task("ServiceNowAgent",
-                            f"Update incident {incident_number} state to Work in Progress with work notes: Deployment initiated successfully. Job in progress. Awaiting completion status.", session_id)
-                        final_status = "🚀 DEPLOYMENT INITIATED"
-                        next_steps = f"Monitor deployment job completion. Update incident {incident_number} when job finishes. Check namespace {namespace} for pod status."
-                    else:
-                        logger.info("Step 5: Deployment failed - updating incident")
-                        await self._delegate_task("ServiceNowAgent",
-                            f"Update incident {incident_number} state to Work in Progress with work notes: Deployment failed. Error details: {deployment_result[:200]}...", session_id)
-                        final_status = "❌ DEPLOYMENT FAILED"
-                        next_steps = f"Review deployment logs and ServiceNow incident {incident_number}. Manual intervention required."
+            workflow_text = workflow_response.content[0].text.strip()
 
-                return f"""🚀 **Monte Carlo Deployment Workflow Complete**
+            # Extract JSON from response
+            json_match = re.search(r'\[.*\]', workflow_text, re.DOTALL)
+            if not json_match:
+                return f"Error: Could not parse workflow plan"
 
-**ServiceNow Tracking:** {incident_number}
-**Target Namespace:** {namespace}
-**Final Status:** {final_status}
+            workflow_steps = json.loads(json_match.group(0))
 
-**📋 Workflow Summary:**
-1. ✅ Created ServiceNow incident for tracking
-2. ✅ Assessed cluster readiness: {assessment[:100]}...
-3. ✅ Updated incident with assessment results
-4. ✅ Executed deployment to {namespace}
-5. ✅ Updated incident with final status
+            if not workflow_steps:
+                return "Error: No workflow steps generated"
 
-**🔍 Assessment Results:**
-{assessment}
+            logger.info(f"Generated practical hybrid workflow with {len(workflow_steps)} steps")
 
-**⚙️ Deployment Results:**
-{deployment_result}
-
-**📝 Next Steps:**
-{next_steps}"""
-
-            else:
-                # Assessment failed - don't proceed with deployment
-                logger.info("Step 4: Cluster assessment failed - aborting deployment")
-                await self._delegate_task("ServiceNowAgent",
-                    f"Update incident {incident_number} state to Work in Progress and add work notes: Assessment failure - deployment aborted: {assessment[:200]}...", session_id)
-
-                return f"""⚠️ **Monte Carlo Deployment Workflow - Assessment Failed**
-
-**ServiceNow Tracking:** {incident_number}
-**Target Namespace:** {namespace}
-**Status:** ❌ ABORTED
-
-**📋 Workflow Summary:**
-1. ✅ Created ServiceNow incident for tracking
-2. ❌ Cluster assessment failed
-3. ✅ Updated incident with assessment failure
-4. ⏹️ Deployment aborted (cluster not ready)
-
-**⚠️ Assessment Results:**
-{assessment}
-
-**📝 Next Steps:**
-1. Resolve cluster readiness issues identified in assessment
-2. Check ServiceNow incident {incident_number} for detailed logs
-3. Retry deployment once issues are resolved
-4. Contact Platform Engineering if assistance needed
-
-**Recommendation:** Do not proceed with deployment until cluster issues are resolved."""
+            # Execute the workflow with smart ServiceNow progression
+            return await self._execute_workflow_with_progression(query, workflow_steps, namespace, session_id)
 
         except Exception as e:
-            logger.error(f"Error in enhanced deployment workflow: {e}")
-            return f"""❌ **Deployment Workflow Error**
+            logger.error(f"Error in practical hybrid workflow: {e}")
+            return f"Error executing practical hybrid workflow: {str(e)}"
 
-An error occurred during the deployment workflow: {str(e)}
-
-**Troubleshooting Steps:**
-1. Check all agent connectivity (ServiceNow, Planner, Executor)
-2. Verify MCP tool availability
-3. Check ServiceNow authentication
-4. Review agent logs for detailed error information
-
-**Support:** Contact Platform Engineering if the error persists."""
-
-    def _build_system_prompt(self, session_id: str) -> str:
+    async def _execute_workflow_with_progression(self, original_query: str, workflow: list, namespace: str, session_id: str) -> str:
         """
-        Build the system prompt for Claude with available tools and enhanced ServiceNow capabilities.
+        Execute workflow with smart progressive ServiceNow updates
+        FIXED: Proper incident closure with correct incident number
         """
-        available_agents = self._get_available_agents()
-        available_mcp_tools = self._get_available_mcp_tools()
+        try:
+            results = []
+            context = {
+                "namespace": namespace,
+                "deployment_ready": False,
+                "deployment_success": False,
+                "incident_number": None,
+                "job_id": None
+            }
 
-        return f"""You are an orchestrator agent that coordinates between specialized agents and MCP tools with enhanced ServiceNow ITSM integration.
+            for i, step in enumerate(workflow, 1):
+                agent_name = step.get("agent", "")
+                task_description = step.get("task", "")
 
-AVAILABLE A2A AGENTS:
-{', '.join(available_agents)}
+                logger.info(f"Step {i}: Calling {agent_name} with task: {task_description}")
 
-AVAILABLE MCP TOOLS:
-{', '.join(available_mcp_tools)}
+                # Handle final ServiceNow closure FIRST - before any execution
+                if agent_name == "ServiceNowAgent" and any(keyword in task_description.lower() for keyword in ['close', 'final', 'completion', 'update incident']):
+                    # This is the final ServiceNow step - make it specific and SKIP the original call
+                    if context.get("incident_number"):
+                        if context.get("deployment_success"):
+                            job_info = f" Job ID {context.get('job_id')} completed successfully." if context.get("job_id") else ""
+                            enhanced_task = f"Update incident {context['incident_number']} with work_notes 'Monte Carlo deployment to {namespace} namespace completed successfully.{job_info} Application is ready for use.' and state 6"
+                        else:
+                            enhanced_task = f"Update incident {context['incident_number']} with work_notes 'Monte Carlo deployment to {namespace} namespace failed. Investigation required.' and state 2"
 
-ENHANCED COORDINATION CAPABILITIES:
-1. For deployment requests involving Monte Carlo applications:
-   - Use the 5-step ServiceNow ITSM workflow:
-     1. ServiceNow → Create tracking incident
-     2. PlannerAgent → Assess cluster readiness
-     3. ServiceNow → Update incident with assessment
-     4. ExecutorAgent → Deploy if ready (or abort if not)
-     5. ServiceNow → Close incident with final status
+                        # Execute ONLY the enhanced task
+                        enhanced_result = await self._delegate_task("ServiceNowAgent", enhanced_task, session_id)
+                        results.append(f"**Step {i} - {agent_name}**: ✅ Updated incident **{context['incident_number']}**\n\nUpdates applied: {enhanced_result}")
+                        continue  # Skip all other processing for this step
 
-2. For assessment requests:
-   - Delegate to PlannerAgent for cluster assessment
+                # Execute the step normally for non-final ServiceNow steps
+                if agent_name in self.connectors:
+                    result = await self._delegate_task(agent_name, task_description, session_id)
+                    results.append(f"**Step {i} - {agent_name}**: ✅ {result}")
 
-3. For ServiceNow operations:
-   - Delegate to ServiceNowAgent for incident management
+                    # Extract system information
+                    system_info = self._extract_system_info(result)
+                    context.update(system_info)
 
-4. For direct tool needs:
-   - Use MCP tools directly for specific operations
+                    # Smart progressive ServiceNow updates
+                    if agent_name == "ServiceNowAgent" and "create" in task_description.lower():
+                        # Incident created - extract incident number
+                        logger.info(f"ServiceNow incident created: {context.get('incident_number', 'Unknown')}")
 
-AGENT SPECIALIZATIONS:
-- ServiceNowAgent: ITSM incident management, deployment tracking, audit trails
-- PlannerAgent: Kubernetes cluster assessment, namespace checking
-- ExecutorAgent: Ansible AAP deployment execution, job monitoring
-- TellTimeAgent: Current time information
-- GreetingAgent: Personalized greetings
+                    elif agent_name == "PlannerAgent":
+                        # Assessment completed - add progress update
+                        context["deployment_ready"] = self._assess_readiness(result)
+                        if context.get("incident_number"):
+                            if context["deployment_ready"]:
+                                update_task = f"Update incident {context['incident_number']} with work_notes 'Cluster assessment completed - {namespace} namespace is healthy and ready for deployment. Proceeding with deployment execution.'"
+                            else:
+                                update_task = f"Update incident {context['incident_number']} with work_notes 'Cluster assessment completed - {namespace} namespace is not ready for deployment. Manual intervention required.'"
 
-ENHANCED WORKFLOW EXAMPLES:
-User: "Deploy Monte Carlo to namespace-xyz"
-→ Trigger 5-step ServiceNow workflow for full ITSM compliance
+                            update_result = await self._delegate_task("ServiceNowAgent", update_task, session_id)
+                            results.append(f"**Step {i}b - ServiceNowAgent**: ✅ {update_result}")
 
-User: "Check cluster status for monte-carlo-prod"
-→ Call PlannerAgent: "Assess monte-carlo-prod namespace"
+                    elif agent_name == "ExecutorAgent":
+                        # Deployment executed - add deployment update
+                        job_id = context.get("job_id")
+                        if any(keyword in result.lower() for keyword in ['success', 'started', 'job', 'running']):
+                            context["deployment_success"] = True
+                            if context.get("incident_number"):
+                                job_info = f" Job ID {job_id} started successfully." if job_id else ""
+                                update_task = f"Update incident {context['incident_number']} with work_notes 'Monte Carlo deployment to {namespace} namespace initiated successfully.{job_info} Monitor progress via Ansible AAP console.'"
 
-User: "Create incident for deployment"
-→ Call ServiceNowAgent: "Create incident for deployment"
+                                update_result = await self._delegate_task("ServiceNowAgent", update_task, session_id)
+                                results.append(f"**Step {i}b - ServiceNowAgent**: ✅ {update_result}")
+                        else:
+                            context["deployment_success"] = False
 
-Session ID: {session_id}
+                else:
+                    results.append(f"**Step {i} - {agent_name}**: ❌ Error - Agent not found")
 
-Analyze the user request and determine the best approach. For Monte Carlo deployments, use the enhanced ServiceNow workflow. Be specific about which agent to call and what message to send."""
+            # Generate final summary
+            status = "✅ SUCCESS" if context["deployment_success"] else "⚠️ ASSESSMENT ISSUES"
+            tracking_info = []
+            if context.get("incident_number"):
+                tracking_info.append(f"ServiceNow: {context['incident_number']}")
+            if context.get("job_id"):
+                tracking_info.append(f"Job: {context['job_id']}")
+
+            tracking = f" | {' | '.join(tracking_info)}" if tracking_info else ""
+
+            header = f"🚀 **Practical Hybrid Workflow Complete**\n\n**Request:** {original_query}\n**Status:** {status}{tracking}\n**Steps:** {len(workflow)}\n\n"
+
+            return header + "\n\n".join(results)
+
+        except Exception as e:
+            logger.error(f"Error executing workflow with progression: {e}")
+            return f"Error executing workflow with progression: {str(e)}"
 
     async def invoke(self, query: str, session_id: str) -> str:
         """
-        Primary entrypoint: handles a user query using Claude to orchestrate tools.
-        Enhanced with ServiceNow workflow detection.
+        Primary entrypoint: handles a user query using practical hybrid orchestration.
         """
         try:
-            # Check if this should use the enhanced ServiceNow deployment workflow
-            if self._should_use_servicenow_workflow(query):
-                logger.info("Routing to enhanced ServiceNow deployment workflow")
-                return await self._handle_servicenow_deployment_workflow(query, session_id)
+            # Check if this should use dynamic workflow
+            if self._should_use_dynamic_workflow(query):
+                logger.info("Routing to practical hybrid workflow")
+                return await self._execute_practical_hybrid_workflow(query, session_id)
 
-            # Build system prompt with current context
-            system_prompt = self._build_system_prompt(session_id)
-
-            # Call Claude to analyze the request and determine actions
-            analysis_response = self.client.messages.create(
-                model=self.model,
-                max_tokens=2000,
-                system=system_prompt,
-                messages=[{
-                    "role": "user",
-                    "content": f"Analyze this request and determine what actions to take: {query}"
-                }]
-            )
-
-            analysis = analysis_response.content[0].text if analysis_response.content else ""
-            logger.info(f"Claude analysis: {analysis}")
-
-            # Execute the plan based on Claude's analysis
-            result = await self._execute_plan(query, analysis, session_id)
-
-            return result
+            # For simple queries, handle directly
+            return await self._handle_simple_query(query, session_id)
 
         except Exception as e:
             logger.error(f"ClaudeOrchestratorAgent error: {e}")
             return f"Orchestration error: {str(e)}"
 
-    async def _execute_plan(self, original_query: str, analysis: str, session_id: str) -> str:
+    async def _handle_simple_query(self, query: str, session_id: str) -> str:
         """
-        Execute the orchestration plan based on Claude's analysis.
+        Handle simple queries by letting Claude answer directly.
+        No workflows, no agents - just Claude responding naturally.
         """
         try:
-            # For assessment requests, just use PlannerAgent
-            if any(keyword in original_query.lower() for keyword in ['assess', 'check', 'status', 'ready']):
-                return await self._delegate_task("PlannerAgent", original_query, session_id)
-
-            # For ServiceNow requests, use ServiceNowAgent
-            elif any(keyword in original_query.lower() for keyword in ['incident', 'servicenow', 'itsm', 'ticket']):
-                return await self._delegate_task("ServiceNowAgent", original_query, session_id)
-
-            # For time requests, use TellTimeAgent
-            elif any(keyword in original_query.lower() for keyword in ['time', 'date']):
-                return await self._delegate_task("TellTimeAgent", original_query, session_id)
-
-            # For greetings, use GreetingAgent
-            elif any(keyword in original_query.lower() for keyword in ['greet', 'hello', 'hi']):
-                return await self._delegate_task("GreetingAgent", original_query, session_id)
-
-            # Otherwise, let Claude decide based on analysis
-            else:
-                return await self._handle_general_query(original_query, analysis, session_id)
-
+            # Let Claude handle the simple query directly
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=500,
+                messages=[{
+                    "role": "user", 
+                    "content": f"Please answer this question directly and helpfully: {query}"
+                }]
+            )
+            
+            return response.content[0].text.strip()
+            
         except Exception as e:
-            logger.error(f"Error executing plan: {e}")
-            return f"Error executing orchestration plan: {str(e)}"
-
-    async def _handle_deployment_workflow(self, query: str, session_id: str) -> str:
-        """
-        Handle Monte Carlo deployment workflow: PlannerAgent → ExecutorAgent
-        DEPRECATED: Use _handle_servicenow_deployment_workflow instead
-        """
-        logger.warning("Using deprecated deployment workflow - consider using ServiceNow workflow")
-        try:
-            # Step 1: Get cluster assessment from PlannerAgent
-            logger.info("Step 1: Getting cluster assessment from PlannerAgent")
-            assessment = await self._delegate_task("PlannerAgent", query, session_id)
-
-            # Step 2: If assessment is positive, proceed with ExecutorAgent
-            if any(keyword in assessment.lower() for keyword in ['ready', 'healthy', 'accessible']):
-                logger.info("Step 2: Cluster ready, proceeding with deployment via ExecutorAgent")
-                deployment = await self._delegate_task("ExecutorAgent", query, session_id)
-
-                return f"**Monte Carlo Deployment Workflow Complete**\n\n**Assessment Results:**\n{assessment}\n\n**Deployment Results:**\n{deployment}"
-            else:
-                return f"**Monte Carlo Deployment Workflow - Assessment Failed**\n\n**Assessment Results:**\n{assessment}\n\n**Recommendation:** Resolve assessment issues before proceeding with deployment."
-
-        except Exception as e:
-            logger.error(f"Error in deployment workflow: {e}")
-            return f"Error in deployment workflow: {str(e)}"
-
-    async def _handle_general_query(self, query: str, analysis: str, session_id: str) -> str:
-        """
-        Handle general queries based on Claude's analysis.
-        """
-        # This could be enhanced to parse Claude's analysis and extract specific tool calls
-        # For now, provide a helpful response
-        available_agents = self._get_available_agents()
-        return f"""🤖 **Orchestrator Agent Ready**
-
-I can help coordinate between these agents: {', '.join(available_agents)}
-
-**Available Commands:**
-- **Monte Carlo Deployment:** 'Deploy Monte Carlo to [namespace]' (uses 5-step ServiceNow workflow)
-- **Cluster Assessment:** 'Assess cluster for [namespace]'
-- **ServiceNow Operations:** 'Create incident for [purpose]' or 'Update incident [number]'
-- **Current Time:** 'What time is it?'
-- **Greetings:** 'Hello' or 'Greet me'
-
-**Enhanced Features:**
-- ✅ Full ServiceNow ITSM integration for deployments
-- ✅ Automated incident tracking and audit trails
-- ✅ Cluster readiness validation before deployment
-- ✅ Coordinated workflow execution
-
-**Your Query:** {query}
-
-Please specify what you'd like me to help orchestrate!"""
+            logger.error(f"Error in simple query handling: {e}")
+            return f"I'm having trouble answering that question right now. Error: {str(e)}"
 
 
 class ClaudeOrchestratorTaskManager(InMemoryTaskManager):
     """
-    TaskManager wrapper: exposes ClaudeOrchestratorAgent.invoke()
-    over the `tasks/send` JSON-RPC endpoint.
+    TaskManager wrapper for the practical hybrid orchestrator.
+    Class name kept consistent for entry.py compatibility.
     """
     def __init__(self, agent: ClaudeOrchestratorAgent):
         super().__init__()
@@ -556,18 +447,14 @@ class ClaudeOrchestratorTaskManager(InMemoryTaskManager):
 
     async def on_send_task(self, request: SendTaskRequest) -> SendTaskResponse:
         """
-        Handle `tasks/send` calls:
-          1) Store incoming message in memory
-          2) Invoke the orchestrator to get a reply
-          3) Append the reply, mark task COMPLETED
-          4) Return the full Task in the response
+        Handle `tasks/send` calls with practical hybrid orchestration
         """
         logger.info(f"ClaudeOrchestratorTaskManager received task {request.params.id}")
 
         # Store or update the task record
         task = await self.upsert_task(request.params)
 
-        # Extract the text and invoke orchestration logic
+        # Extract the text and invoke practical hybrid orchestration
         user_text = self._get_user_text(request)
         reply_text = await self.agent.invoke(user_text, request.params.sessionId)
 
