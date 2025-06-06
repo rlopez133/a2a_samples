@@ -18,7 +18,7 @@ This repository demonstrates a distributed multi-agent system that combines Goog
 
 ```bash
 version_4_multi_agent_mcp/
-├── .env                             # YOUR GOOGLE_API_KEY, etc. (gitignored)
+├── .env                             # YOUR ANTHROPIC_API_KEY, etc. (gitignored)
 ├── pyproject.toml                   # Project metadata & dependencies
 ├── README.md                        # This file
 ├── utilities/
@@ -33,15 +33,27 @@ version_4_multi_agent_mcp/
 ├── agents/
 │   ├── tell_time_agent/
 │   │   ├── __main__.py         # Starts TellTimeAgent server
-│   │   ├── agent.py            # Gemini-based time agent
+│   │   ├── agent.py            # Claude-based time agent
 │   │   └── task_manager.py     # In-memory task handler for TellTimeAgent
 │   ├── greeting_agent/
 │   │   ├── __main__.py         # Starts GreetingAgent server
 │   │   ├── agent.py            # Orchestrator that calls TellTimeAgent + LLM greeting
 │   │   └── task_manager.py     # Task handler for GreetingAgent
+│   ├── planner_agent
+│   │   ├── __main__.py         # Starts PlannerAgent server
+│   │   ├── agent.py            
+│   │   └── task_manager.py
+│   ├── servicenow_agent
+│   │   ├── __main__.py         # Starts ServiceNowAgent server
+│   │   ├── agent.py
+│   │   └── task_manager.py
+│   ├── executor_agent         # Starts ExecutorAgent server
+│   │   ├── __main__.py
+│   │   ├── agent.py
+│   │   └── task_manager.py
 │   └── host_agent/
 │       ├── entry.py                 # CLI: boots the OrchestratorAgent server
-│       ├── orchestrator.py          # Gemini LLM routing logic + TaskManager
+│       ├── orchestrator.py          # Claude LLM routing logic + TaskManager
 │       └── ... (no more agent_connect here)
 ├── server/
 │   ├── server.py                    # A2A JSON-RPC server (Starlette)
@@ -87,7 +99,7 @@ version_4_multi_agent_mcp/
    Create a `.env` in the project root containing:  
    ```bash
    touch .env
-   echo "GOOGLE_API_KEY=your_gemini_api_key_here" > .env
+   echo "ANTHROPIC_API_KEY=your_anthropic_api_key_here" > .env
    ```
 
 ---
@@ -97,11 +109,14 @@ version_4_multi_agent_mcp/
 ### 1. Start your child A2A agents
 
 ```bash
-# TellTimeAgent (returns current time)
-uv run python3 -m agents.tell_time_agent --host localhost --port 10002
+# PlannerAgent
+python -m agents.planner_agent --port 10003
 
-# GreetingAgent (calls TellTimeAgent + LLM greeting)
-uv run python3 -m agents.greeting_agent --host localhost --port 10001
+# ExecutorAgent
+python -m agents.executor_agent --port 10004
+
+# ServiceNowAgent
+python -m agents.servicenow_agent --port 10005
 ```
 
 > Each agent serves a JSON-RPC endpoint at `/` and advertises metadata at `/.well-known/agent.json`.
@@ -109,13 +124,13 @@ uv run python3 -m agents.greeting_agent --host localhost --port 10001
 ### 2. Start the Host OrchestratorAgent
 
 ```bash
-uv run python3 -m agents.host_agent.entry --host localhost --port 10000
+python -m agents.host_agent.entry --host localhost --port 10000
 ```
 
 ### 3. Use the CLI to talk to your Orchestrator
 
 ```bash
-uv run python3 -m app.cmd.cmd --agent http://localhost:10000
+python -m app.cmd.cmd --agent http://localhost:10000
 ```
 ---
 
@@ -129,7 +144,7 @@ uv run python3 -m app.cmd.cmd --agent http://localhost:10000
    - **MCP branch:** Discovers MCP servers, loads & exposes each tool.
 
 3. **Child A2A Agents**  
-   - Domain-specific handlers (time, greetings).
+   - Domain-specific handlers (kubernetes/openshift, ansible, servicenow).
 
 4. **MCP Servers**  
    - Serve tool definitions & executions over stdio.
