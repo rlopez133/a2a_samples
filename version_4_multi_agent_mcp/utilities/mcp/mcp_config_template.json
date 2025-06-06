@@ -1,12 +1,36 @@
 {
-    "mcpServers": {
-        "terminal": {
-            "command": "/Users/theailanguage/.local/bin/uv",
-            "args": [
-                "--directory", "/Users/theailanguage/mcp/servers/terminal_server",
-                "run", 
-                "terminal_server.py"
-            ]
+  "mcpServers": {
+    "ansible": {
+        "command": "path/to/bin/uv",
+        "args": [
+            "--directory",
+            "/path/to/ansible_mcp",
+            "run",
+            "ansible.py"
+        ],
+        "env": {
+            "AAP_TOKEN": "mytoken",
+            "AAP_URL": "https://aap.example.com/api/controller/v2"
         }
+    },
+    "kubernetes": {
+      "command": "jbang",
+      "args": [
+        "--quiet",
+        "https://github.com/quarkiverse/quarkus-mcp-servers/blob/main/kubernetes/src/main/java/io/quarkiverse/mcp/servers/kubernetes/MCPServerKubernetes.java"
+      ]
+    },
+    "servicenow": {
+      "command": "/path/to/bin/python",
+      "args": [
+        "-m",
+        "mcp_server_servicenow.cli"
+      ],
+      "env": {
+        "SERVICENOW_INSTANCE_URL": "https://myexample.service-now.com/",
+        "SERVICENOW_USERNAME": "myusername",
+        "SERVICENOW_PASSWORD": "mypassword"
+      }
     }
+  }
 }
