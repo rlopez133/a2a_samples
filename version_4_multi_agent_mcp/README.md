@@ -75,7 +75,7 @@ version_4_multi_agent_mcp/
 
 - Python 3.11+
 - [uv](https://github.com/astral-sh/uv) (optional, for streamlined venv & installs)
-- A valid `GOOGLE_API_KEY` with access to Gemini via the Google ADK
+- A valid `ANTHROPIC_API_KEY
 
 ---
 
@@ -83,13 +83,13 @@ version_4_multi_agent_mcp/
 
 1. **Clone & enter**  
    ```bash
-   git clone https://github.com/theailanguage/a2a_samples.git
+   git clone https://github.com/rlopez133/a2a_samples.git
    cd version_4_multi_agent_mcp
    ```
 
 2. **Create & activate virtualenv**  
    ```bash
-   cd version_4p01_with_vision_agent
+   cd version_4_multi_agent_mcp
    uv venv
    source .venv/bin/activate
    uv sync --all-groups
